@@ -1,0 +1,153 @@
+#!/bin/sh
+# Panel stats for the LXQt customcommand widget: CPU%, temp, RAM%, net rates.
+# One awk process per tick: the previous sample is kept in a state file, so
+# there is no sleep and no second /proc read.
+# Default network interface is auto-detected from the default route.
+# An optional argument tags the state file, so two bars calling this script
+# (the LXQt panel and tmux) each keep their own previous sample. The argument
+# --tmux is that tag plus a rendering style: each value is wrapped in a tmux
+# #[fg=...] style chosen by threshold (green / orange / red) and the labels
+# become Nerd Font icons. Plain text stays the default, because the LXQt panel
+# widget would print the style sequences verbatim and its font is not patched.
+#
+# Every field is padded to a fixed width with U+2007 FIGURE SPACE, which is
+# exactly as wide as a digit, so the text never changes width and the panel
+# does not shift. Network rates are smoothed with an exponential moving
+# average (ALPHA) because the raw per-tick rate is very jumpy.
+#
+# The rendered line is cached as the second line of the state file. A caller
+# that asks again within TTL seconds gets that same line back instead of a
+# fresh measurement, so the panel and tmux always agree even though they tick
+# at different intervals.
+case $1 in --tmux) style=tmux; tag=tmux ;; *) style=plain; tag=$1 ;; esac
+
+LC_ALL=C exec awk -v state="${XDG_RUNTIME_DIR:-/tmp}/panel-stats${tag:+-$tag}" \
+                  -v style="$style" '
+BEGIN {
+    ALPHA = 0.4; TTL = 1.5
+
+    # thresholds: at or above WARN_* the value turns orange, at or above
+    # CRIT_* it turns red, below WARN_* it is green
+    WARN_CPU  = 60; CRIT_CPU  = 85
+    WARN_TEMP = 70; CRIT_TEMP = 85
+    WARN_RAM  = 70; CRIT_RAM  = 88
+
+    COLOUR_OK   = "#5fd700"
+    COLOUR_WARN = "#ffaf00"
+    COLOUR_CRIT = "#ff5f5f"
+
+    if (style == "tmux") {
+        I_CPU  = "\357\222\274 "   # U+F4BC nf-oct-cpu
+        I_TEMP = "\357\213\211 "   # U+F2C9 nf-fa-thermometer_half
+        I_RAM  = "\356\277\205 "   # U+EFC5 nf-md-memory
+        I_RX   = "\357\202\253 "   # U+F0AB nf-fa-arrow_circle_down
+        I_TX   = "\357\202\252 "   # U+F0AA nf-fa-arrow_circle_up
+        A_RX = ""; A_TX = ""
+    } else {
+        I_CPU = "CPU "; I_TEMP = ""; I_RAM = "RAM "
+        I_RX = ""; I_TX = ""
+        A_RX = "\342\206\223"      # U+2193 down arrow
+        A_TX = "\342\206\221"      # U+2191 up arrow
+    }
+}
+
+$0 == "coretemp" { tempfile = FILENAME; sub(/name$/, "temp1_input", tempfile) }
+
+END {
+    while ((getline l < "/proc/net/route") > 0) {
+        split(l, f, /[ \t]+/)
+        if (f[1] != "Iface" && f[2] == "00000000") { iface = f[1]; break }
+    }
+    close("/proc/net/route")
+
+    while ((getline l < "/proc/stat") > 0)
+        if (l ~ /^cpu /) {
+            n = split(l, f, " ")
+            for (i = 2; i <= n; i++) tot += f[i]
+            idle = f[5] + f[6]
+            break
+        }
+    close("/proc/stat")
+
+    getline l < "/proc/uptime"; close("/proc/uptime")
+    split(l, f, " "); up = f[1]
+
+    while ((getline l < "/proc/meminfo") > 0) {
+        split(l, f, /[: ]+/)
+        if (f[1] == "MemTotal") mt = f[2]
+        else if (f[1] == "MemAvailable") { ma = f[2]; break }
+    }
+    close("/proc/meminfo")
+
+    if (iface != "") {
+        rxf = "/sys/class/net/" iface "/statistics/rx_bytes"
+        txf = "/sys/class/net/" iface "/statistics/tx_bytes"
+        getline rx < rxf; close(rxf)
+        getline tx < txf; close(txf)
+    }
+
+    if (tempfile != "" && (getline c < tempfile) > 0) temp = c / 1000
+    close(tempfile)
+
+    if ((getline l < state) > 0) {
+        getline cached < state          # second line: the last rendered output
+        split(l, p, " ")
+        dtot = tot - p[1]
+        dt = up - p[3]
+        if (dt < TTL && cached != "") { print cached; close(state); exit }
+        if (dtot > 0) cpu = 100 * (dtot - (idle - p[2])) / dtot
+        if (dt > 0.1 && p[6] == iface) {
+            vrx = (rx - p[4]) / dt
+            vtx = (tx - p[5]) / dt
+            # smooth towards the new reading instead of showing it raw
+            vrx = ALPHA * vrx + (1 - ALPHA) * p[7]
+            vtx = ALPHA * vtx + (1 - ALPHA) * p[8]
+        }
+    }
+    close(state)
+
+    out = I_CPU hot(cpu, WARN_CPU, CRIT_CPU) pad(sprintf("%d", cpu + 0.5) "%", 4) off()
+    if (temp) out = out " " I_TEMP hot(temp, WARN_TEMP, CRIT_TEMP) pad(sprintf("%d", temp + 0.5), 3) "\302\260C" off()
+    if (mt) {
+        ram = 100 * (mt - ma) / mt
+        out = out "  " I_RAM hot(ram, WARN_RAM, CRIT_RAM) pad(sprintf("%d", ram + 0.5) "%", 4) off()
+    }
+    if (iface != "") out = out "  " I_RX pad(hum(vrx), 5) A_RX " " I_TX pad(hum(vtx), 5) A_TX
+
+    printf("%d %d %s %d %d %s %d %d\n%s\n", tot, idle, up, rx, tx, iface, vrx, vtx, out) > state
+    close(state)
+    print out
+}
+
+# bytes/s -> kilobytes, rolling over to megabytes once the number gets long
+function hum(v,    k) {
+    k = v / 1024
+    if (k < 10)     return sprintf("%.1fK", k)
+    if (k < 1024)   return sprintf("%.0fK", k)
+    if (k < 102400) return sprintf("%.1fM", k / 1024)
+    return sprintf("%.0fM", k / 1024)
+}
+
+# tmux style sequence for a value that should go green / orange / red, empty
+# when the output is plain text
+function hot(v, warn, crit) {
+    if (style != "tmux") return ""
+    if (v >= crit) return "#[fg=" COLOUR_CRIT "]"
+    if (v >= warn) return "#[fg=" COLOUR_WARN "]"
+    return "#[fg=" COLOUR_OK "]"
+}
+
+# back to the colour of the surrounding status segment
+function off() {
+    return (style == "tmux") ? "#[default]" : ""
+}
+
+# left-pad with FIGURE SPACE; length() is byte-based under LC_ALL=C, so this
+# must only ever be called with a plain ASCII string
+function pad(s, w,    n, r) {
+    n = w - length(s)
+    r = ""
+    while (n-- > 0) r = r "\342\200\207"
+    return r s
+}
+' /sys/class/hwmon/*/name
