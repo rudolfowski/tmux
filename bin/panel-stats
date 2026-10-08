@@ -21,8 +21,26 @@
 # at different intervals.
 case $1 in --tmux) style=tmux; tag=tmux ;; *) style=plain; tag=$1 ;; esac
 
+# macOS has no /proc or /sys: a small C sampler next to this script prints the
+# same raw readings on one line (see panel-stats-darwin.c). It is compiled on
+# first use and again whenever the source is newer than the binary, so a git
+# pull is all it takes to update it.
+helper=
+sources='/sys/class/hwmon/*/name'
+if [ "$(uname -s)" = Darwin ]; then
+    self=$(readlink -f "$0" 2>/dev/null || printf %s "$0")
+    dir=${self%/*}
+    helper=$dir/panel-stats-darwin
+    if [ ! -x "$helper" ] || [ "$helper.c" -nt "$helper" ]; then
+        cc -O2 -o "$helper.$$" "$helper.c" \
+            -framework IOKit -framework CoreFoundation 2>/dev/null &&
+            mv -f "$helper.$$" "$helper" || { rm -f "$helper.$$"; exit 0; }
+    fi
+    sources=/dev/null
+fi
+
 LC_ALL=C exec awk -v state="${XDG_RUNTIME_DIR:-/tmp}/panel-stats${tag:+-$tag}" \
-                  -v style="$style" '
+                  -v style="$style" -v helper="$helper" '
 BEGIN {
     ALPHA = 0.4; TTL = 1.5
 
@@ -54,6 +72,41 @@ BEGIN {
 $0 == "coretemp" { tempfile = FILENAME; sub(/name$/, "temp1_input", tempfile) }
 
 END {
+    if (helper != "") darwin()
+    else linux()
+
+    if ((getline l < state) > 0) {
+        getline cached < state          # second line: the last rendered output
+        split(l, p, " ")
+        dtot = tot - p[1]
+        dt = up - p[3]
+        if (dt < TTL && cached != "") { print cached; close(state); exit }
+        if (dtot > 0) cpu = 100 * (dtot - (idle - p[2])) / dtot
+        if (dt > 0.1 && p[6] == iface) {
+            vrx = (rx - p[4]) / dt
+            vtx = (tx - p[5]) / dt
+            # smooth towards the new reading instead of showing it raw
+            vrx = ALPHA * vrx + (1 - ALPHA) * p[7]
+            vtx = ALPHA * vtx + (1 - ALPHA) * p[8]
+        }
+    }
+    close(state)
+
+    out = I_CPU hot(cpu, WARN_CPU, CRIT_CPU) pad(sprintf("%d", cpu + 0.5) "%", 4) off()
+    if (temp) out = out " " I_TEMP hot(temp, WARN_TEMP, CRIT_TEMP) pad(sprintf("%d", temp + 0.5), 3) "\302\260C" off()
+    if (mt) {
+        ram = 100 * (mt - ma) / mt
+        out = out "  " I_RAM hot(ram, WARN_RAM, CRIT_RAM) pad(sprintf("%d", ram + 0.5) "%", 4) off()
+    }
+    if (iface != "") out = out "  " I_RX pad(hum(vrx), 5) A_RX " " I_TX pad(hum(vtx), 5) A_TX
+
+    printf("%d %d %s %d %d %s %d %d\n%s\n", tot, idle, up, rx, tx, iface, vrx, vtx, out) > state
+    close(state)
+    print out
+}
+
+# raw readings on Linux: /proc, /sys and the coretemp hwmon file
+function linux(    l, f, i, n, c, rxf, txf) {
     while ((getline l < "/proc/net/route") > 0) {
         split(l, f, /[ \t]+/)
         if (f[1] != "Iface" && f[2] == "00000000") { iface = f[1]; break }
@@ -88,35 +141,18 @@ END {
 
     if (tempfile != "" && (getline c < tempfile) > 0) temp = c / 1000
     close(tempfile)
+}
 
-    if ((getline l < state) > 0) {
-        getline cached < state          # second line: the last rendered output
-        split(l, p, " ")
-        dtot = tot - p[1]
-        dt = up - p[3]
-        if (dt < TTL && cached != "") { print cached; close(state); exit }
-        if (dtot > 0) cpu = 100 * (dtot - (idle - p[2])) / dtot
-        if (dt > 0.1 && p[6] == iface) {
-            vrx = (rx - p[4]) / dt
-            vtx = (tx - p[5]) / dt
-            # smooth towards the new reading instead of showing it raw
-            vrx = ALPHA * vrx + (1 - ALPHA) * p[7]
-            vtx = ALPHA * vtx + (1 - ALPHA) * p[8]
-        }
+# raw readings on macOS: one line from panel-stats-darwin
+#   tot idle up memtotal_kb memavail_kb iface rx tx temp
+function darwin(    l, f) {
+    if ((helper | getline l) > 0) {
+        split(l, f, " ")
+        tot = f[1]; idle = f[2]; up = f[3]; mt = f[4]; ma = f[5]
+        if (f[6] != "-") { iface = f[6]; rx = f[7]; tx = f[8] }
+        temp = f[9] + 0
     }
-    close(state)
-
-    out = I_CPU hot(cpu, WARN_CPU, CRIT_CPU) pad(sprintf("%d", cpu + 0.5) "%", 4) off()
-    if (temp) out = out " " I_TEMP hot(temp, WARN_TEMP, CRIT_TEMP) pad(sprintf("%d", temp + 0.5), 3) "\302\260C" off()
-    if (mt) {
-        ram = 100 * (mt - ma) / mt
-        out = out "  " I_RAM hot(ram, WARN_RAM, CRIT_RAM) pad(sprintf("%d", ram + 0.5) "%", 4) off()
-    }
-    if (iface != "") out = out "  " I_RX pad(hum(vrx), 5) A_RX " " I_TX pad(hum(vtx), 5) A_TX
-
-    printf("%d %d %s %d %d %s %d %d\n%s\n", tot, idle, up, rx, tx, iface, vrx, vtx, out) > state
-    close(state)
-    print out
+    close(helper)
 }
 
 # bytes/s -> kilobytes, rolling over to megabytes once the number gets long
@@ -150,4 +186,4 @@ function pad(s, w,    n, r) {
     while (n-- > 0) r = r "\342\200\207"
     return r s
 }
-' /sys/class/hwmon/*/name
+' $sources
