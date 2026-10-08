@@ -402,6 +402,11 @@ set -g mouse on
 # (an ssh login on macOS has it empty and would wipe the launchd agent socket)
 set -g update-environment "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
 
+# accept OSC 52 from programs in panes (nvim or tmux over ssh) and pass it on
+# to the terminal; the default "external" drops it, so a copy made on a remote
+# host never reached the local clipboard
+set -g set-clipboard on
+
 # force Vi mode
 #   really you should export VISUAL or EDITOR environment variable, see manual
 #set -g status-keys vi
