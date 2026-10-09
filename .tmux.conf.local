@@ -407,6 +407,13 @@ set -g update-environment "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AGENT_PID SSH_CONN
 # host never reached the local clipboard
 set -g set-clipboard on
 
+# reorder windows: <prefix> S-Left / S-Right moves the current window one slot
+# (repeatable); < and > stay on Oh my tmux!'s swap-pane
+# both ends are pinned to the current session: without -s, swap-window takes
+# the marked pane's window as source, which may live in another session
+bind -r S-Left run -C "swap-window -d -s '#{session_id}:' -t '#{session_id}:-1'"
+bind -r S-Right run -C "swap-window -d -s '#{session_id}:' -t '#{session_id}:+1'"
+
 # force Vi mode
 #   really you should export VISUAL or EDITOR environment variable, see manual
 #set -g status-keys vi
